@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from powercontext.cli.env_file import environment_context, read_environment_file
+from powercontext.paths import POWERCONTEXT_HOME_ENV
 from powercontext.server.settings import ServerSettings
 
 
@@ -32,13 +33,20 @@ def server_settings_context(
     host: str | None = None,
     port: int | None = None,
     env_file: Path | None = None,
+    data_dir: Path | None = None,
 ) -> Iterator[ServerSettings]:
     """Load one reproducible Server configuration for the lifetime of a process operation."""
 
     loaded: Mapping[str, str] = read_environment_file(env_file) if env_file is not None else {}
+    if data_dir is not None:
+        loaded = {**loaded, POWERCONTEXT_HOME_ENV: str(data_dir.expanduser().resolve())}
     server_environment = {name for name in os.environ if name.startswith("POWERCONTEXT_SERVER_")}
+    if data_dir is not None:
+        server_environment.add(POWERCONTEXT_HOME_ENV)
     loaded_context = (
-        environment_context(loaded, override=True, clear=server_environment) if env_file is not None else nullcontext()
+        environment_context(loaded, override=True, clear=server_environment)
+        if env_file is not None or data_dir is not None
+        else nullcontext()
     )
     with loaded_context:
         http_overrides: dict[str, Any] = {}

@@ -142,6 +142,8 @@ class ServiceDefinition:
             "powercontext.service.launcher",
             "--endpoint",
             self.endpoint,
+            "--data-dir",
+            self.data_dir,
         ]
         if self.env_file is not None:
             arguments.extend(("--env-file", self.env_file.path))
@@ -201,9 +203,16 @@ class ServiceStatus:
 class ServiceError(RuntimeError):
     """Report a safe, actionable personal-service operation failure."""
 
-    def __init__(self, message: str, *, exit_code: int = 1) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int = 1,
+        status: ServiceStatus | None = None,
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.status = status
 
 
 def _required_string(value: dict[str, object], name: str) -> str:

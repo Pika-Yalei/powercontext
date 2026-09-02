@@ -21,7 +21,7 @@ import re
 import socket
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from pydantic import ValidationError
 
@@ -51,7 +51,8 @@ def probe_server(endpoint: str, *, timeout: float = 2.0) -> ProbeResult:
         headers={"Accept": "application/json", "User-Agent": "powercontext-service"},
     )
     try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(request, timeout=timeout) as response:
             status_code = response.getcode()
             content_type = response.headers.get_content_type()
             request_id = response.headers.get("X-PowerContext-Request-ID", "")

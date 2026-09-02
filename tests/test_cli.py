@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+import subprocess
+import sys
 from importlib.metadata import version
 from pathlib import Path
 from types import TracebackType
@@ -163,6 +165,37 @@ def test_cli_exposes_installed_role_commands() -> None:
     assert all(command in result.output for command in ("capabilities", "candidate", "stats", "service", "server"))
     assert "builtin" not in result.output
     assert "client" not in result.output
+
+
+def test_service_command_provider_requires_the_complete_server_role() -> None:
+    script = """
+import builtins
+
+real_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "fastapi" or name.startswith("fastapi."):
+        raise ModuleNotFoundError("blocked server dependency", name="fastapi")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+try:
+    import powercontext.service.cli  # noqa: F401
+except ModuleNotFoundError as error:
+    if error.name != "fastapi":
+        raise
+else:
+    raise AssertionError("service command loaded without the complete Server role")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_client_settings_load_environment(monkeypatch: pytest.MonkeyPatch) -> None:

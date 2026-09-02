@@ -42,7 +42,7 @@ class SystemdUserAdapter:
     identifier = "powercontext.service"
 
     def __init__(self, *, config_home: Path | None = None) -> None:
-        root = config_home or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        root = _systemd_config_home() if config_home is None else config_home
         self.artifact_path = root / "systemd" / "user" / self.identifier
         self.lock_path = self.artifact_path.with_name(f".{self.identifier}.lock")
 
@@ -166,6 +166,15 @@ def _systemd_quote(value: str) -> str:
         )
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
     return f'"{escaped}"'
+
+
+def _systemd_config_home() -> Path:
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    if configured:
+        candidate = Path(configured)
+        if candidate.is_absolute():
+            return candidate
+    return Path.home() / ".config"
 
 
 def _command_detail(stderr: str) -> str:

@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-import uvicorn as _server_role_dependency
 
+from powercontext.server import cli as _server_role_dependency
 from powercontext.service.controller import ServiceController
 from powercontext.service.model import ServiceError, ServiceStatus
 
@@ -56,6 +56,8 @@ def install(
         status = _controller().install(env_file=env_file)
     except (OSError, ServiceError) as error:
         typer.echo(f"PowerContext personal service installation failed: {error}", err=True)
+        if isinstance(error, ServiceError) and error.status is not None:
+            _write_status(error.status, json_output=False)
         raise typer.Exit(code=error.exit_code if isinstance(error, ServiceError) else 1) from error
     typer.echo("PowerContext personal service installed.")
     _write_status(status, json_output=False)

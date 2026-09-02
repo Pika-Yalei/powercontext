@@ -35,6 +35,9 @@ from powercontext.service.model import (
     SupportState,
 )
 
+_FAILURE_LIMIT = 3
+_FAILURE_WINDOW_SECONDS = 60
+
 
 class LaunchdUserAdapter:
     identifier = "com.oceanbase.powercontext"
@@ -85,7 +88,7 @@ class LaunchdUserAdapter:
         log_dir = Path(definition.data_dir) / "logs"
         payload: dict[str, Any] = {
             "Label": self.identifier,
-            "ProgramArguments": definition.launcher_arguments(),
+            "ProgramArguments": _launcher_arguments(definition),
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
             "ThrottleInterval": 5,
@@ -100,6 +103,8 @@ class LaunchdUserAdapter:
         return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 
     def write(self, content: bytes) -> None:
+        definition = _definition_from_payload(plistlib.loads(content))
+        (Path(definition.data_dir) / "logs").mkdir(mode=0o700, parents=True, exist_ok=True)
         atomic_write(self.artifact_path, content)
 
     def restore(self, content: bytes | None) -> None:
@@ -112,6 +117,10 @@ class LaunchdUserAdapter:
         return None
 
     def enable(self) -> None:
+        registration = self.inspect()
+        if registration.definition is not None:
+            (Path(registration.definition.data_dir) / "logs").mkdir(mode=0o700, parents=True, exist_ok=True)
+            _failure_state_path(registration.definition).unlink(missing_ok=True)
         self._run("enable", self._target)
 
     def start(self, *, reload_definition: bool) -> None:
@@ -120,9 +129,6 @@ class LaunchdUserAdapter:
             self._run("bootout", self._target)
             loaded = False
         if not loaded:
-            registration = self.inspect()
-            if registration.definition is not None:
-                (Path(registration.definition.data_dir) / "logs").mkdir(mode=0o700, parents=True, exist_ok=True)
             self._run("bootstrap", self._domain, str(self.artifact_path))
         elif self.manager_state() is not ManagerState.ACTIVE:
             self._run("kickstart", "-k", self._target)
@@ -175,6 +181,22 @@ def _definition_from_payload(payload: dict[str, Any]) -> ServiceDefinition:
     if not isinstance(metadata, str):
         raise TypeError("LaunchAgent is missing PowerContext service metadata")  # noqa: TRY003
     return decode_metadata(metadata)
+
+
+def _failure_state_path(definition: ServiceDefinition) -> Path:
+    return Path(definition.data_dir) / "logs" / "launchd-retry-state.json"
+
+
+def _launcher_arguments(definition: ServiceDefinition) -> list[str]:
+    return [
+        *definition.launcher_arguments(),
+        "--failure-state",
+        str(_failure_state_path(definition)),
+        "--failure-limit",
+        str(_FAILURE_LIMIT),
+        "--failure-window-seconds",
+        str(_FAILURE_WINDOW_SECONDS),
+    ]
 
 
 def _command_detail(stderr: str) -> str:

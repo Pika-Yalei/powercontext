@@ -21,14 +21,14 @@ import stat
 import sys
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from importlib.metadata import version
 from pathlib import Path
 
 from pydantic import ValidationError
 
-from powercontext.cli.env_file import EnvironmentFileError
-from powercontext.paths import powercontext_data_dir
+from powercontext.cli.env_file import EnvironmentFileError, environment_context
+from powercontext.paths import POWERCONTEXT_HOME_ENV, powercontext_data_dir
 from powercontext.server.configuration import server_settings_context
 from powercontext.service.adapters import NativeServiceAdapter, native_service_adapter
 from powercontext.service.adapters.base import definition_state
@@ -88,12 +88,20 @@ class ServiceController:
             else:
                 self._adapter.enable()
 
-            should_restart = changed and manager_before is ManagerState.ACTIVE
+            should_restart = manager_before is ManagerState.ACTIVE and (
+                changed or initial_probe.state is ProbeState.UNREACHABLE
+            )
             if should_restart or initial_probe.state is not ProbeState.LIVE:
-                self._adapter.start(reload_definition=changed)
+                try:
+                    self._adapter.start(reload_definition=changed or should_restart)
+                except (OSError, ServiceError) as error:
+                    raise self._post_commit_error(  # noqa: TRY003
+                        f"the personal service was registered but the native manager could not start it: {error}",
+                        exit_code=error.exit_code if isinstance(error, ServiceError) else 1,
+                    ) from error
                 final_probe = self._wait_until_live(definition.endpoint)
                 if final_probe.state is not ProbeState.LIVE:
-                    raise ServiceError(  # noqa: TRY003
+                    raise self._post_commit_error(  # noqa: TRY003
                         f"the personal service was registered but did not become live: {final_probe.detail}; "
                         f"inspect {self._adapter.log_location(definition) or 'the native service logs'}"
                     )
@@ -185,8 +193,11 @@ class ServiceController:
                     "to a protected file and pass --env-file",
                     exit_code=2,
                 )
+        clean_home_context = (
+            environment_context({}, clear={POWERCONTEXT_HOME_ENV}) if resolved_env is not None else nullcontext()
+        )
         try:
-            with server_settings_context(env_file=resolved_env) as settings:
+            with clean_home_context, server_settings_context(env_file=resolved_env) as settings:
                 host = settings.http.host
                 if not is_loopback_host(host):
                     raise ServiceError(  # noqa: TRY003
@@ -208,6 +219,13 @@ class ServiceController:
             data_dir=data_dir,
             env_file=EnvironmentFileIdentity.from_path(resolved_env) if resolved_env is not None else None,
         )
+
+    def _post_commit_error(self, message: str, *, exit_code: int = 1) -> ServiceError:
+        try:
+            status = self.status()
+        except Exception:
+            status = None
+        return ServiceError(message, exit_code=exit_code, status=status)
 
     def _commit_definition(self, definition: ServiceDefinition, previous: bytes | None) -> None:
         content = self._adapter.render(definition)

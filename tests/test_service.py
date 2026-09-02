@@ -29,7 +29,9 @@ from unittest.mock import Mock
 import pytest
 from typer.testing import CliRunner
 
+from powercontext.paths import POWERCONTEXT_HOME_ENV, powercontext_data_dir
 from powercontext.service import launcher as service_launcher
+from powercontext.service import probe as service_probe
 from powercontext.service.adapters.base import decode_metadata, encode_metadata
 from powercontext.service.adapters.launchd import LaunchdUserAdapter
 from powercontext.service.adapters.systemd import SystemdUserAdapter
@@ -78,6 +80,7 @@ class FakeAdapter:
         self.manager = ManagerState.INACTIVE
         self.events: list[str] = []
         self.fail_enable = False
+        self.fail_start = False
 
     def support(self) -> tuple[SupportState, str]:
         return SupportState.SUPPORTED, "fake manager available"
@@ -110,6 +113,8 @@ class FakeAdapter:
 
     def start(self, *, reload_definition: bool) -> None:
         self.events.append(f"start:{reload_definition}")
+        if self.fail_start:
+            raise ServiceError("start failed")  # noqa: TRY003
         self.manager = ManagerState.ACTIVE
 
     def stop(self) -> None:
@@ -171,6 +176,22 @@ def test_service_install_is_idempotent_when_definition_is_current(tmp_path: Path
     assert adapter.events == ["enable"]
 
 
+def test_service_install_restarts_an_active_but_unreachable_registration(tmp_path: Path) -> None:
+    adapter = FakeAdapter(tmp_path)
+    ServiceController(adapter, probe=_manager_probe(adapter), sleep=lambda _: None).install()
+    adapter.events.clear()
+    probes = iter([
+        ProbeResult(ProbeState.UNREACHABLE, "hung process"),
+        ProbeResult(ProbeState.LIVE, "restarted"),
+        ProbeResult(ProbeState.LIVE, "restarted"),
+    ])
+
+    status = ServiceController(adapter, probe=lambda _: next(probes), sleep=lambda _: None).install()
+
+    assert status.ok
+    assert adapter.events == ["enable", "start:True"]
+
+
 def test_service_install_rejects_a_non_powercontext_listener_before_writing(tmp_path: Path) -> None:
     adapter = FakeAdapter(tmp_path)
     controller = ServiceController(
@@ -197,6 +218,24 @@ def test_service_install_restores_the_previous_definition_when_enable_fails(tmp_
 
     assert adapter.definition == previous
     assert adapter.events == ["write", "reload", "enable", "disable", "restore", "reload", "enable"]
+
+
+def test_service_install_preserves_status_when_the_native_start_command_fails(tmp_path: Path) -> None:
+    adapter = FakeAdapter(tmp_path)
+    adapter.fail_start = True
+    controller = ServiceController(
+        adapter,
+        probe=lambda endpoint: ProbeResult(ProbeState.UNREACHABLE, f"cannot reach {endpoint}"),
+    )
+
+    with pytest.raises(ServiceError, match="native manager could not start") as raised:
+        controller.install()
+
+    assert raised.value.status is not None
+    assert raised.value.status.registration is RegistrationState.INSTALLED
+    assert raised.value.status.manager is ManagerState.INACTIVE
+    assert raised.value.status.server_liveness is LivenessState.UNREACHABLE
+    assert raised.value.status.log_location == "fake logs"
 
 
 def test_service_uninstall_stops_before_removing_the_owned_definition(tmp_path: Path) -> None:
@@ -244,6 +283,24 @@ def test_service_install_accepts_a_private_environment_file(
     assert adapter.definition.env_file.path == str(environment)
 
 
+def test_service_install_does_not_inherit_an_unrecorded_shell_data_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = tmp_path / "powercontext.env"
+    environment.write_text("POWERCONTEXT_SERVER_HTTP_PORT=8123\n", encoding="utf-8")
+    environment.chmod(0o600)
+    ambient_data = tmp_path / "ambient-data"
+    monkeypatch.setenv(POWERCONTEXT_HOME_ENV, str(ambient_data))
+    adapter = FakeAdapter(tmp_path)
+
+    ServiceController(adapter, probe=_manager_probe(adapter), sleep=lambda _: None).install(env_file=environment)
+
+    assert adapter.definition is not None
+    assert Path(adapter.definition.data_dir).is_absolute()
+    assert Path(adapter.definition.data_dir) != ambient_data
+
+
 def test_service_install_rejects_a_group_readable_environment_file(tmp_path: Path) -> None:
     environment = tmp_path / "powercontext.env"
     environment.write_text("POWERCONTEXT_SERVER_HTTP_PORT=8123\n", encoding="utf-8")
@@ -270,7 +327,22 @@ def test_systemd_definition_round_trips_and_detects_tampering(tmp_path: Path) ->
     assert adapter.inspect().state is RegistrationState.INVALID
 
 
-def test_launchd_definition_round_trips_with_argument_array_and_logs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("configured", ["", "relative/config"])
+def test_systemd_ignores_non_absolute_xdg_config_home(
+    configured: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", configured)
+
+    adapter = SystemdUserAdapter()
+
+    assert adapter.artifact_path == Path.home() / ".config" / "systemd" / "user" / "powercontext.service"
+
+
+def test_launchd_definition_round_trips_with_argument_array_and_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     adapter = LaunchdUserAdapter(home=tmp_path, uid=501)
     executable = str(tmp_path / "Power Context" / "bin" / "python")
     definition = _definition(tmp_path, python_executable=executable)
@@ -284,6 +356,22 @@ def test_launchd_definition_round_trips_with_argument_array_and_logs(tmp_path: P
     assert installed.definition == definition
     assert payload["ProgramArguments"][0] == executable
     assert payload["StandardOutPath"].endswith("logs/server.stdout.log")
+    assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert payload["ProgramArguments"][-4:] == [
+        "--failure-limit",
+        "3",
+        "--failure-window-seconds",
+        "60",
+    ]
+    assert (Path(definition.data_dir) / "logs").is_dir()
+
+    failure_state = Path(definition.data_dir) / "logs" / "launchd-retry-state.json"
+    failure_state.write_text("[]", encoding="utf-8")
+    run = Mock()
+    monkeypatch.setattr(adapter, "_run", run)
+    adapter.enable()
+    assert not failure_state.exists()
+    run.assert_called_once_with("enable", "gui/501/com.oceanbase.powercontext")
 
 
 class _LivenessHandler(BaseHTTPRequestHandler):
@@ -313,6 +401,20 @@ def test_service_probe_recognizes_the_powercontext_liveness_contract() -> None:
     server, thread, endpoint = _serve(_LivenessHandler)
     try:
         assert probe_server(endpoint).state is ProbeState.LIVE
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_service_probe_bypasses_process_http_proxy_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    server, thread, endpoint = _serve(_LivenessHandler)
+    try:
+        assert service_probe.probe_server(endpoint).state is ProbeState.LIVE
     finally:
         server.shutdown()
         server.server_close()
@@ -361,7 +463,36 @@ def test_service_status_json_preserves_the_stable_state_contract(monkeypatch: py
     assert json.loads(result.output) == status.as_json()
 
 
-def test_service_launcher_hands_control_to_the_foreground_server_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_install_cli_renders_post_commit_failure_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    status = ServiceStatus(
+        support=SupportState.SUPPORTED,
+        registration=RegistrationState.INSTALLED,
+        definition=DefinitionState.CURRENT,
+        manager=ManagerState.FAILED,
+        server_liveness=LivenessState.UNREACHABLE,
+        endpoint="http://127.0.0.1:8000",
+        log_location="fake logs",
+        recovery_action="inspect logs",
+        detail="cannot reach endpoint",
+    )
+    controller = Mock()
+    controller.install.side_effect = ServiceError("start failed", status=status)
+    monkeypatch.setattr("powercontext.service.cli._controller", lambda: controller)
+
+    result = CliRunner().invoke(service_app, ["install"])
+
+    assert result.exit_code == 1
+    assert "installation failed: start failed" in result.output
+    assert "registration: installed" in result.output
+    assert "manager: failed" in result.output
+    assert "server liveness: unreachable (http://127.0.0.1:8000)" in result.output
+    assert "logs: fake logs" in result.output
+
+
+def test_service_launcher_hands_control_to_the_foreground_server_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     run_server = Mock()
     monkeypatch.setattr(
         service_launcher,
@@ -370,7 +501,8 @@ def test_service_launcher_hands_control_to_the_foreground_server_runner(monkeypa
     )
     monkeypatch.setattr(service_launcher.server_cli, "_run_configured_server", run_server)
 
-    exit_code = service_launcher.main(["--endpoint", "http://127.0.0.1:8000"])
+    data_dir = tmp_path / "data"
+    exit_code = service_launcher.main(["--endpoint", "http://127.0.0.1:8000", "--data-dir", str(data_dir)])
 
     assert exit_code == 0
     run_server.assert_called_once()
@@ -378,7 +510,40 @@ def test_service_launcher_hands_control_to_the_foreground_server_runner(monkeypa
     assert run_server.call_args.args[0].http.port == 8000
 
 
+def test_service_launcher_pins_the_recorded_data_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = tmp_path / "powercontext.env"
+    environment.write_text(f"{POWERCONTEXT_HOME_ENV}={tmp_path / 'other-data'}\n", encoding="utf-8")
+    recorded_data = tmp_path / "recorded-data"
+    observed_data: list[Path] = []
+    monkeypatch.setattr(
+        service_launcher,
+        "probe_server",
+        lambda _endpoint: ProbeResult(ProbeState.UNREACHABLE, "not listening"),
+    )
+    monkeypatch.setattr(
+        service_launcher.server_cli,
+        "_run_configured_server",
+        lambda _settings: observed_data.append(powercontext_data_dir()),
+    )
+
+    exit_code = service_launcher.main([
+        "--endpoint",
+        "http://127.0.0.1:8000",
+        "--data-dir",
+        str(recorded_data),
+        "--env-file",
+        str(environment),
+    ])
+
+    assert exit_code == 0
+    assert observed_data == [recorded_data]
+
+
 def test_service_launcher_does_not_start_over_an_existing_powercontext_server(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_server = Mock()
@@ -389,7 +554,33 @@ def test_service_launcher_does_not_start_over_an_existing_powercontext_server(
     )
     monkeypatch.setattr(service_launcher.server_cli, "_run_configured_server", run_server)
 
-    exit_code = service_launcher.main(["--endpoint", "http://127.0.0.1:8000"])
+    exit_code = service_launcher.main(["--endpoint", "http://127.0.0.1:8000", "--data-dir", str(tmp_path / "data")])
 
     assert exit_code == 0
     run_server.assert_not_called()
+
+
+def test_launchd_launcher_stops_after_a_bounded_number_of_rapid_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        service_launcher,
+        "probe_server",
+        lambda _endpoint: ProbeResult(ProbeState.CONFLICT, "conflicting listener"),
+    )
+    failure_state = tmp_path / "logs" / "launchd-retry-state.json"
+    arguments = [
+        "--endpoint",
+        "http://127.0.0.1:8000",
+        "--data-dir",
+        str(tmp_path),
+        "--failure-state",
+        str(failure_state),
+        "--failure-limit",
+        "3",
+        "--failure-window-seconds",
+        "60",
+    ]
+
+    assert [service_launcher.main(arguments) for _ in range(4)] == [1, 1, 0, 0]
