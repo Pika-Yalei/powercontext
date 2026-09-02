@@ -69,7 +69,11 @@ def test_native_personal_service_lifecycle(tmp_path: Path) -> None:
         assert loaded.definition.python_executable == os.path.abspath(sys.executable)
 
         adapter.stop()
-        assert adapter.loaded_registration().state is ManagerOwnershipState.NOT_LOADED
+        if isinstance(adapter, LaunchdUserAdapter):
+            assert adapter.loaded_registration().state is ManagerOwnershipState.NOT_LOADED
+        else:
+            assert adapter.loaded_registration().state is ManagerOwnershipState.OWNED
+            assert adapter.manager_state() is ManagerState.INACTIVE
 
         adapter.start(reload_definition=False)
         restarted = _wait_for_status(controller)
