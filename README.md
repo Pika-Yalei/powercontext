@@ -59,13 +59,25 @@ integration. HTTP API users need only the first install command and can skip eve
 
 ### 2. Start and verify the local Server
 
-Keep the Server running in one terminal:
+For a persistent personal Server that survives terminal closure and starts again after login, install the native
+current-user service:
+
+```bash
+powercontext service install
+powercontext service status
+```
+
+Linux uses `systemd --user`; macOS uses a per-user LaunchAgent. Neither path needs administrator privileges. To use a
+non-default configuration, generate and protect an environment file, then pass it explicitly with
+`powercontext service install --env-file <path>`.
+
+For interactive troubleshooting, the existing foreground command remains available:
 
 ```bash
 powercontext server run
 ```
 
-In another terminal, verify the service and plugin:
+In another terminal, verify the Server and plugin:
 
 ```bash
 powercontext doctor

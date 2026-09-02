@@ -17,6 +17,8 @@ powercontext config init --output .env
 powercontext config show --env-file .env
 powercontext config validate --env-file .env
 powercontext server run --env-file .env
+# 或安装持久个人服务：
+powercontext service install --env-file .env
 ```
 
 `config init` 会以 `0600` 权限写入文件。`server run` 收到 `--env-file` 后，文件中的赋值会覆盖进程中的同名值；

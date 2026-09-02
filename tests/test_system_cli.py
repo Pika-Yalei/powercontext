@@ -559,6 +559,7 @@ class _Response(BytesIO):
 
 
 def test_default_doctor_checks_server_without_inspecting_codex(monkeypatch) -> None:
+    _mock_optional_personal_service(monkeypatch)
     monkeypatch.setattr(
         system_cli,
         "run_codex_diagnostics",
@@ -581,10 +582,17 @@ def test_default_doctor_checks_server_without_inspecting_codex(monkeypatch) -> N
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["status"] == "ok"
-    assert list(payload["checks"]) == ["package", "server_liveness", "server_readiness"]
+    assert list(payload["checks"]) == [
+        "package",
+        "service_support",
+        "service_registration",
+        "server_liveness",
+        "server_readiness",
+    ]
 
 
 def test_default_doctor_skips_readiness_when_liveness_is_unreachable(monkeypatch) -> None:
+    _mock_optional_personal_service(monkeypatch)
     urlopen = Mock(side_effect=OSError("connection refused"))
     monkeypatch.setattr(system_cli, "urlopen", urlopen)
 
@@ -597,6 +605,8 @@ def test_default_doctor_skips_readiness_when_liveness_is_unreachable(monkeypatch
 
 
 def test_default_doctor_preserves_not_ready_checks_in_human_and_json_output(monkeypatch) -> None:
+    _mock_optional_personal_service(monkeypatch)
+
     def responses() -> list[object]:
         readiness = HTTPError(
             "http://127.0.0.1:8000/health/ready",
@@ -638,6 +648,7 @@ def test_default_doctor_preserves_not_ready_checks_in_human_and_json_output(monk
 
 
 def test_default_doctor_preserves_degraded_checks_in_human_and_json_output(monkeypatch) -> None:
+    _mock_optional_personal_service(monkeypatch)
     monkeypatch.setattr(system_cli, "version", lambda _package: "0.0.2")
 
     def responses() -> list[_Response]:
@@ -674,6 +685,16 @@ def test_default_doctor_preserves_degraded_checks_in_human_and_json_output(monke
                 "status": "ok",
                 "detail": "powercontext 0.0.2",
             },
+            "service_support": {
+                "ok": True,
+                "status": "ok",
+                "detail": "native personal service adapter is supported",
+            },
+            "service_registration": {
+                "ok": True,
+                "status": "ok",
+                "detail": "not_installed (optional)",
+            },
             "server_liveness": {
                 "ok": True,
                 "status": "ok",
@@ -691,6 +712,23 @@ def test_default_doctor_preserves_degraded_checks_in_human_and_json_output(monke
             },
         },
     }
+
+
+def _mock_optional_personal_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        system_cli,
+        "_local_service_diagnostics",
+        lambda _server_url: {
+            "service_support": Diagnostic(
+                status=DiagnosticStatus.OK,
+                detail="native personal service adapter is supported",
+            ),
+            "service_registration": Diagnostic(
+                status=DiagnosticStatus.OK,
+                detail="not_installed (optional)",
+            ),
+        },
+    )
 
 
 def test_doctor_codex_reports_missing_cli_and_skipped_plugin(monkeypatch) -> None:

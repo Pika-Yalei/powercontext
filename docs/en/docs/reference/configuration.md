@@ -19,6 +19,8 @@ powercontext config init --output .env
 powercontext config show --env-file .env
 powercontext config validate --env-file .env
 powercontext server run --env-file .env
+# Or install the persistent personal service:
+powercontext service install --env-file .env
 ```
 
 `config init` writes the file with mode `0600`. When `server run` receives `--env-file`, assignments in that file

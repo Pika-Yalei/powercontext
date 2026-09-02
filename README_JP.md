@@ -51,7 +51,16 @@ powercontext setup select --host codex --host claude-code --host opencode \
 
 ### 2. ローカル Server を起動して検証する
 
-1 つのターミナルで Server を起動したままにします。
+ターミナルを閉じても Server を実行し続け、次回ログイン時に自動起動するには、現在のユーザー用ネイティブサービスを
+インストールします。
+
+```bash
+powercontext service install
+powercontext service status
+```
+
+Linux では `systemd --user`、macOS ではユーザー LaunchAgent を使用し、管理者権限は不要です。対話的なトラブル
+シューティングでは、既存のフォアグラウンドコマンドも引き続き使用できます。
 
 ```bash
 powercontext server run

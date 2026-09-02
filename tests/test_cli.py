@@ -160,7 +160,7 @@ def test_cli_exposes_installed_role_commands() -> None:
     result = CliRunner().invoke(create_cli(), ["--help"])
 
     assert result.exit_code == 0
-    assert all(command in result.output for command in ("capabilities", "candidate", "stats", "server"))
+    assert all(command in result.output for command in ("capabilities", "candidate", "stats", "service", "server"))
     assert "builtin" not in result.output
     assert "client" not in result.output
 

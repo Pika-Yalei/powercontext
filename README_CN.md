@@ -56,13 +56,23 @@ powercontext setup select --host codex --host claude-code --host opencode \
 
 ### 2. 启动并验证本地 Server
 
-在一个终端中保持 Server 运行：
+如需 Server 在终端关闭后继续运行，并在下次登录后自动启动，请安装原生当前用户服务：
+
+```bash
+powercontext service install
+powercontext service status
+```
+
+Linux 使用 `systemd --user`，macOS 使用当前用户 LaunchAgent，均不需要管理员权限。非默认配置应先生成并保护环境文件，
+再执行 `powercontext service install --env-file <path>`。
+
+交互式排障时仍可使用原有前台命令：
 
 ```bash
 powercontext server run
 ```
 
-在另一个终端中验证服务和 Plugin：
+在另一个终端中验证 Server 和 Plugin：
 
 ```bash
 powercontext doctor
