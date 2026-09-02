@@ -22,9 +22,19 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
-from powercontext.cli.env_file import environment_context, read_environment_file
+from pydantic import ValidationError
+
+from powercontext.cli.env_file import EnvironmentFileError, environment_context, read_environment_file
 from powercontext.paths import POWERCONTEXT_HOME_ENV
 from powercontext.server.settings import ServerSettings
+
+
+class ServerConfigurationError(ValueError):
+    """Report a failure while loading or constructing Server settings."""
+
+    def __init__(self, cause: EnvironmentFileError | OSError | ValidationError | ValueError) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 @contextmanager
@@ -33,11 +43,23 @@ def server_settings_context(
     host: str | None = None,
     port: int | None = None,
     env_file: Path | None = None,
+    environment: Mapping[str, str] | None = None,
     data_dir: Path | None = None,
 ) -> Iterator[ServerSettings]:
     """Load one reproducible Server configuration for the lifetime of a process operation."""
 
-    loaded: Mapping[str, str] = read_environment_file(env_file) if env_file is not None else {}
+    if env_file is not None and environment is not None:
+        raise ServerConfigurationError(ValueError("env_file and environment are mutually exclusive"))
+    try:
+        loaded: Mapping[str, str] = (
+            read_environment_file(env_file)
+            if env_file is not None
+            else dict(environment)
+            if environment is not None
+            else {}
+        )
+    except (EnvironmentFileError, OSError) as error:
+        raise ServerConfigurationError(error) from error
     if data_dir is not None:
         loaded = {**loaded, POWERCONTEXT_HOME_ENV: str(data_dir.expanduser().resolve())}
     server_environment = {name for name in os.environ if name.startswith("POWERCONTEXT_SERVER_")}
@@ -45,7 +67,7 @@ def server_settings_context(
         server_environment.add(POWERCONTEXT_HOME_ENV)
     loaded_context = (
         environment_context(loaded, override=True, clear=server_environment)
-        if env_file is not None or data_dir is not None
+        if env_file is not None or environment is not None or data_dir is not None
         else nullcontext()
     )
     with loaded_context:
@@ -55,7 +77,11 @@ def server_settings_context(
         if port is not None:
             http_overrides["port"] = port
         settings_kwargs: dict[str, Any] = {"http": http_overrides} if http_overrides else {}
-        yield ServerSettings(**settings_kwargs)
+        try:
+            settings = ServerSettings(**settings_kwargs)
+        except ValidationError as error:
+            raise ServerConfigurationError(error) from error
+        yield settings
 
 
-__all__ = ["server_settings_context"]
+__all__ = ["ServerConfigurationError", "server_settings_context"]

@@ -16,12 +16,14 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
-DEFINITION_VERSION = 1
+DEFINITION_VERSION = 2
 OWNERSHIP_MARKER = "powercontext.personal-server"
 
 
@@ -51,6 +53,13 @@ class ManagerState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ManagerOwnershipState(StrEnum):
+    NOT_LOADED = "not_loaded"
+    OWNED = "owned"
+    FOREIGN = "foreign"
+    UNKNOWN = "unknown"
+
+
 class LivenessState(StrEnum):
     LIVE = "live"
     UNREACHABLE = "unreachable"
@@ -70,17 +79,24 @@ class EnvironmentFileIdentity:
     inode: int
     size: int
     modified_ns: int
+    owner_uid: int
+    mode: int
 
     @classmethod
-    def from_path(cls, path: Path) -> EnvironmentFileIdentity:
-        status = path.stat()
+    def from_stat(cls, path: Path, status: os.stat_result) -> EnvironmentFileIdentity:
         return cls(
-            path=str(path),
+            path=os.path.abspath(path),
             device=status.st_dev,
             inode=status.st_ino,
             size=status.st_size,
             modified_ns=status.st_mtime_ns,
+            owner_uid=status.st_uid,
+            mode=stat.S_IMODE(status.st_mode),
         )
+
+    @classmethod
+    def from_path(cls, path: Path) -> EnvironmentFileIdentity:
+        return cls.from_stat(path, path.stat())
 
 
 @dataclass(frozen=True)
@@ -124,6 +140,8 @@ class ServiceDefinition:
                 inode=_required_int(environment_payload, "inode"),
                 size=_required_int(environment_payload, "size"),
                 modified_ns=_required_int(environment_payload, "modified_ns"),
+                owner_uid=_optional_int(environment_payload, "owner_uid", default=-1),
+                mode=_optional_int(environment_payload, "mode", default=-1),
             )
         return cls(
             ownership=_required_string(payload, "ownership"),
@@ -135,11 +153,16 @@ class ServiceDefinition:
             env_file=env_file,
         )
 
-    def launcher_arguments(self) -> list[str]:
+    def launcher_arguments(
+        self,
+        *,
+        module: str = "powercontext.service.launcher",
+        include_env_identity: bool = True,
+    ) -> list[str]:
         arguments = [
             self.python_executable,
             "-m",
-            "powercontext.service.launcher",
+            module,
             "--endpoint",
             self.endpoint,
             "--data-dir",
@@ -147,6 +170,21 @@ class ServiceDefinition:
         ]
         if self.env_file is not None:
             arguments.extend(("--env-file", self.env_file.path))
+            if include_env_identity:
+                arguments.extend((
+                    "--env-file-device",
+                    str(self.env_file.device),
+                    "--env-file-inode",
+                    str(self.env_file.inode),
+                    "--env-file-size",
+                    str(self.env_file.size),
+                    "--env-file-modified-ns",
+                    str(self.env_file.modified_ns),
+                    "--env-file-owner-uid",
+                    str(self.env_file.owner_uid),
+                    "--env-file-mode",
+                    str(self.env_file.mode),
+                ))
         return arguments
 
 
@@ -155,6 +193,13 @@ class NativeRegistration:
     state: RegistrationState
     definition: ServiceDefinition | None = None
     content: bytes | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagerRegistration:
+    state: ManagerOwnershipState
+    definition: ServiceDefinition | None = None
     detail: str | None = None
 
 
@@ -175,6 +220,7 @@ class ServiceStatus:
     log_location: str | None
     recovery_action: str | None = None
     detail: str | None = None
+    manager_ownership: ManagerOwnershipState = ManagerOwnershipState.UNKNOWN
 
     @property
     def ok(self) -> bool:
@@ -182,6 +228,7 @@ class ServiceStatus:
             self.support is SupportState.SUPPORTED
             and self.registration is RegistrationState.INSTALLED
             and self.definition is DefinitionState.CURRENT
+            and self.manager_ownership is ManagerOwnershipState.OWNED
             and self.manager is ManagerState.ACTIVE
             and self.server_liveness is LivenessState.LIVE
         )
@@ -191,6 +238,7 @@ class ServiceStatus:
             "support": self.support.value,
             "registration": self.registration.value,
             "definition": self.definition.value,
+            "manager_ownership": self.manager_ownership.value,
             "manager": self.manager.value,
             "server_liveness": self.server_liveness.value,
             "endpoint": self.endpoint,
@@ -231,12 +279,20 @@ def _required_int(value: dict[str, object], name: str) -> int:
     return field
 
 
+def _optional_int(value: dict[str, object], name: str, *, default: int) -> int:
+    if name not in value:
+        return default
+    return _required_int(value, name)
+
+
 __all__ = [
     "DEFINITION_VERSION",
     "OWNERSHIP_MARKER",
     "DefinitionState",
     "EnvironmentFileIdentity",
     "LivenessState",
+    "ManagerOwnershipState",
+    "ManagerRegistration",
     "ManagerState",
     "NativeRegistration",
     "ProbeResult",

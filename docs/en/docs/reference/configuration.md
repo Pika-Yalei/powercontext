@@ -29,6 +29,10 @@ ignored, so validation and launch use the same Server configuration. `config sho
 generator-recorded credentials; still treat the file itself as a secret-bearing deployment artifact. See the
 [Full-capability Quick Start](../how-to/full-capability-runtime.md) for the guided setup and verification flow.
 
+`service install` additionally requires the file to be a regular, non-symlink file owned by the current user with no
+group or other permissions. The service records its identity and refuses to launch if the file is replaced or its
+ownership, permissions, or contents change; run `service install` again after an intentional update.
+
 ## User data
 
 `POWERCONTEXT_HOME` overrides the directory used by the installed Server:

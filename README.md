@@ -70,6 +70,8 @@ powercontext service status
 Linux uses `systemd --user`; macOS uses a per-user LaunchAgent. Neither path needs administrator privileges. To use a
 non-default configuration, generate and protect an environment file, then pass it explicitly with
 `powercontext service install --env-file <path>`.
+The service requires that file to be owned by the current user with no group or other permissions, and an intentional
+change must be reconciled by running `service install` again.
 
 For interactive troubleshooting, the existing foreground command remains available:
 

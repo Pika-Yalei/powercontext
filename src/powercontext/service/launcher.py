@@ -17,19 +17,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import ValidationError
-
-from powercontext.cli.env_file import EnvironmentFileError
 from powercontext.server import cli as server_cli
-from powercontext.server.configuration import server_settings_context
-from powercontext.service.adapters.base import atomic_write
-from powercontext.service.model import ProbeState
+from powercontext.server.configuration import ServerConfigurationError, server_settings_context
+from powercontext.service.environment import ProtectedEnvironmentFileError, load_protected_environment_file
+from powercontext.service.model import EnvironmentFileIdentity, ProbeState
 from powercontext.service.probe import probe_server
 from powercontext.transport import is_loopback_host
 
@@ -41,112 +36,60 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--failure-state", type=Path)
-    parser.add_argument("--failure-limit", type=int, default=0)
-    parser.add_argument("--failure-window-seconds", type=float, default=0)
+    parser.add_argument("--env-file-device", type=int)
+    parser.add_argument("--env-file-inode", type=int)
+    parser.add_argument("--env-file-size", type=int)
+    parser.add_argument("--env-file-modified-ns", type=int)
+    parser.add_argument("--env-file-owner-uid", type=int)
+    parser.add_argument("--env-file-mode", type=int)
     options = parser.parse_args(arguments)
-    budget = _FailureBudget(
-        path=options.failure_state,
-        limit=options.failure_limit,
-        window_seconds=options.failure_window_seconds,
-    )
-    if not budget.begin_attempt():
-        logger.error("Personal service retry budget is exhausted; run `powercontext service install` to retry")
-        return 0
 
     try:
-        with server_settings_context(env_file=options.env_file, data_dir=options.data_dir) as settings:
+        environment: dict[str, str] | None = None
+        if options.env_file is not None:
+            identity = _environment_identity(options)
+            environment = load_protected_environment_file(options.env_file, expected=identity).values
+        with server_settings_context(environment=environment, data_dir=options.data_dir) as settings:
             expected = _endpoint(settings.http.host, settings.http.port)
             if expected != options.endpoint or not is_loopback_host(settings.http.host):
                 logger.error(
                     "Registered personal service endpoint does not match the current loopback Server configuration"
                 )
-                return budget.failure_exit_code()
+                return 1
             probe = probe_server(options.endpoint)
             if probe.state is ProbeState.LIVE:
                 logger.info("PowerContext Server is already live; the personal service launcher will exit")
-                budget.clear()
                 return 0
             if probe.state is ProbeState.CONFLICT:
                 logger.error("Personal service endpoint conflict: %s", probe.detail)
-                return budget.failure_exit_code()
+                return 1
             server_cli._run_configured_server(settings)
-            budget.clear()
             return 0
-    except (EnvironmentFileError, OSError, ValidationError) as error:
+    except (ProtectedEnvironmentFileError, ServerConfigurationError) as error:
         logger.error("Personal service configuration is invalid: %s", error)  # noqa: TRY400
-        return budget.failure_exit_code()
+        return 1
     except SystemExit as error:
         if error.code is None or error.code == 0:
-            budget.clear()
             return 0
         logger.error("PowerContext personal service exited during startup: %s", error)  # noqa: TRY400
-        return budget.failure_exit_code()
+        return 1
     except Exception:
         logger.exception("PowerContext personal service failed")
-        return budget.failure_exit_code()
-
-
-class _FailureBudget:
-    """Bound rapid launchd retries without supervising the Server process."""
-
-    def __init__(self, *, path: Path | None, limit: int, window_seconds: float) -> None:
-        self._path = path
-        self._limit = limit
-        self._window_seconds = window_seconds
-        self._attempts = 0
-
-    def begin_attempt(self) -> bool:
-        if self._path is None:
-            return True
-        if self._limit < 1 or self._window_seconds <= 0:
-            logger.error("Personal service retry-budget configuration is invalid")
-            return False
-        now = time.time()
-        try:
-            attempts = [attempt for attempt in _read_attempts(self._path) if now - attempt <= self._window_seconds]
-            if len(attempts) >= self._limit:
-                self._attempts = len(attempts)
-                return False
-            attempts.append(now)
-            atomic_write(self._path, json.dumps(attempts, separators=(",", ":")).encode(), mode=0o600)
-        except (OSError, ValueError) as error:
-            logger.error("Cannot update the personal service retry budget: %s", error)  # noqa: TRY400
-            return False
-        self._attempts = len(attempts)
-        return True
-
-    def failure_exit_code(self) -> int:
-        if self._path is not None and self._attempts >= self._limit:
-            logger.error(
-                "Personal service retry budget exhausted after %d attempts; "
-                "run `powercontext service install` to retry",
-                self._attempts,
-            )
-            return 0
         return 1
 
-    def clear(self) -> None:
-        if self._path is None:
-            return
-        try:
-            self._path.unlink(missing_ok=True)
-        except OSError as error:
-            logger.warning("Cannot clear the personal service retry budget: %s", error)
 
-
-def _read_attempts(path: Path) -> list[float]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("invalid retry-budget state") from error  # noqa: TRY003
-    if not isinstance(payload, list) or any(
-        not isinstance(value, (int, float)) or isinstance(value, bool) for value in payload
-    ):
-        raise ValueError("invalid retry-budget state")  # noqa: TRY003
-    return [float(value) for value in payload]
+def _environment_identity(options: argparse.Namespace) -> EnvironmentFileIdentity:
+    fields = {
+        "device": options.env_file_device,
+        "inode": options.env_file_inode,
+        "size": options.env_file_size,
+        "modified_ns": options.env_file_modified_ns,
+        "owner_uid": options.env_file_owner_uid,
+        "mode": options.env_file_mode,
+    }
+    if any(value is None for value in fields.values()):
+        raise ProtectedEnvironmentFileError("the installed --env-file identity is incomplete")  # noqa: TRY003
+    return EnvironmentFileIdentity(path=str(options.env_file), **fields)
 
 
 def _endpoint(host: str, port: int) -> str:

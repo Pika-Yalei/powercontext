@@ -17,27 +17,27 @@
 from __future__ import annotations
 
 import os
-import stat
 import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext, suppress
+from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 
-from pydantic import ValidationError
-
-from powercontext.cli.env_file import EnvironmentFileError, environment_context
+from powercontext.cli.env_file import environment_context
 from powercontext.paths import POWERCONTEXT_HOME_ENV, powercontext_data_dir
-from powercontext.server.configuration import server_settings_context
+from powercontext.server.configuration import ServerConfigurationError, server_settings_context
 from powercontext.service.adapters import NativeServiceAdapter, native_service_adapter
 from powercontext.service.adapters.base import definition_state
+from powercontext.service.environment import ProtectedEnvironmentFileError, load_protected_environment_file
 from powercontext.service.model import (
     DEFINITION_VERSION,
     OWNERSHIP_MARKER,
     DefinitionState,
-    EnvironmentFileIdentity,
     LivenessState,
+    ManagerOwnershipState,
+    ManagerRegistration,
     ManagerState,
     NativeRegistration,
     ProbeResult,
@@ -52,7 +52,7 @@ from powercontext.service.probe import probe_server
 from powercontext.transport import is_loopback_host
 
 _PERSISTED_ENVIRONMENT_PREFIX = "POWERCONTEXT_SERVER_"
-_START_TIMEOUT_SECONDS = 10.0
+_START_TIMEOUT_SECONDS = 30.0
 
 
 class ServiceController:
@@ -81,19 +81,24 @@ class ServiceController:
         with _service_lock(self._adapter.lock_path):
             registration = self._adapter.inspect()
             self._require_mutable_registration(registration)
+            loaded = self._adapter.loaded_registration()
+            self._require_mutable_manager_registration(loaded)
             changed = registration.definition != definition
-            manager_before = self._adapter.manager_state()
+            loaded_changed = loaded.state is ManagerOwnershipState.OWNED and loaded.definition != definition
+            manager_before = (
+                self._adapter.manager_state() if loaded.state is ManagerOwnershipState.OWNED else ManagerState.INACTIVE
+            )
             if changed:
                 self._commit_definition(definition, registration.content)
             else:
                 self._adapter.enable()
 
             should_restart = manager_before is ManagerState.ACTIVE and (
-                changed or initial_probe.state is ProbeState.UNREACHABLE
+                changed or loaded_changed or initial_probe.state is ProbeState.UNREACHABLE
             )
-            if should_restart or initial_probe.state is not ProbeState.LIVE:
+            if loaded_changed or should_restart or initial_probe.state is not ProbeState.LIVE:
                 try:
-                    self._adapter.start(reload_definition=changed or should_restart)
+                    self._adapter.start(reload_definition=changed or loaded_changed or should_restart)
                 except (OSError, ServiceError) as error:
                     raise self._post_commit_error(  # noqa: TRY003
                         f"the personal service was registered but the native manager could not start it: {error}",
@@ -107,8 +112,10 @@ class ServiceController:
                     )
         return self.status()
 
-    def status(self) -> ServiceStatus:
-        support, support_detail = self._adapter.support()
+    def registration_status(self) -> ServiceStatus:
+        """Inspect support, artifact, and definition without touching the manager or endpoint."""
+
+        support, support_detail = self._adapter.platform_support()
         if support is SupportState.UNSUPPORTED:
             return ServiceStatus(
                 support=support,
@@ -120,6 +127,7 @@ class ServiceController:
                 log_location=None,
                 recovery_action=None,
                 detail=support_detail,
+                manager_ownership=ManagerOwnershipState.UNKNOWN,
             )
 
         registration = self._adapter.inspect()
@@ -139,6 +147,7 @@ class ServiceController:
                 log_location=self._adapter.log_location(None),
                 recovery_action=recovery,
                 detail=registration.detail or support_detail,
+                manager_ownership=ManagerOwnershipState.UNKNOWN,
             )
 
         definition = registration.definition
@@ -148,20 +157,56 @@ class ServiceController:
             package_version=installed_version,
             python_executable=sys.executable,
         )
-        manager = self._adapter.manager_state()
-        probe = self._probe(definition.endpoint)
-        liveness = LivenessState.LIVE if probe.state is ProbeState.LIVE else LivenessState.UNREACHABLE
-        recovery = _recovery_action(installed_definition, manager, probe)
         return ServiceStatus(
             support=support,
             registration=registration.state,
             definition=installed_definition,
-            manager=manager,
-            server_liveness=liveness,
+            manager=ManagerState.UNKNOWN,
+            server_liveness=LivenessState.UNKNOWN,
             endpoint=definition.endpoint,
             log_location=self._adapter.log_location(definition),
+            recovery_action=None,
+            detail=registration.detail or support_detail,
+            manager_ownership=ManagerOwnershipState.UNKNOWN,
+        )
+
+    def status(self) -> ServiceStatus:
+        support, support_detail = self._adapter.support()
+        if support is SupportState.UNSUPPORTED:
+            return ServiceStatus(
+                support=support,
+                registration=RegistrationState.UNKNOWN,
+                definition=DefinitionState.UNKNOWN,
+                manager=ManagerState.UNKNOWN,
+                server_liveness=LivenessState.UNKNOWN,
+                endpoint=None,
+                log_location=None,
+                recovery_action=None,
+                detail=support_detail,
+                manager_ownership=ManagerOwnershipState.UNKNOWN,
+            )
+        registration = self.registration_status()
+        if registration.registration is not RegistrationState.INSTALLED:
+            return registration
+
+        loaded = self._adapter.loaded_registration()
+        if loaded.state is ManagerOwnershipState.OWNED:
+            manager = self._adapter.manager_state()
+        elif loaded.state is ManagerOwnershipState.NOT_LOADED:
+            manager = ManagerState.INACTIVE
+        else:
+            manager = ManagerState.UNKNOWN
+        probe = self._probe(registration.endpoint or "")
+        liveness = LivenessState.LIVE if probe.state is ProbeState.LIVE else LivenessState.UNREACHABLE
+        recovery = _recovery_action(registration.definition, manager, probe, loaded)
+        details = [detail for detail in (loaded.detail, probe.detail) if detail]
+        return replace(
+            registration,
+            manager=manager,
+            manager_ownership=loaded.state,
+            server_liveness=liveness,
             recovery_action=recovery,
-            detail=probe.detail,
+            detail="; ".join(details) or None,
         )
 
     def uninstall(self) -> ServiceStatus:
@@ -170,18 +215,28 @@ class ServiceController:
             raise ServiceError(detail)
         with _service_lock(self._adapter.lock_path):
             registration = self._adapter.inspect()
-            if registration.state is RegistrationState.NOT_INSTALLED:
-                return self.status()
             self._require_mutable_registration(registration)
-            self._adapter.stop()
-            self._adapter.disable()
-            self._adapter.remove()
-            self._adapter.reload()
+            loaded = self._adapter.loaded_registration()
+            self._require_mutable_manager_registration(loaded)
+            if (
+                registration.state is RegistrationState.NOT_INSTALLED
+                and loaded.state is ManagerOwnershipState.NOT_LOADED
+            ):
+                return self.status()
+            self._run_uninstall_stage("stop", self._adapter.stop)
+            self._run_uninstall_stage("disable", self._adapter.disable)
+            self._run_uninstall_stage("remove", self._remove_owned_artifact)
+            self._run_uninstall_stage("reload", self._adapter.reload)
         return self.status()
 
     def _build_definition(self, env_file: Path | None) -> ServiceDefinition:
-        resolved_env = _validate_environment_file(env_file) if env_file is not None else None
-        if resolved_env is None:
+        try:
+            loaded_env = load_protected_environment_file(env_file) if env_file is not None else None
+        except ProtectedEnvironmentFileError as error:
+            raise ServiceError(  # noqa: TRY003
+                f"invalid personal service configuration: {error}", exit_code=2
+            ) from error
+        if loaded_env is None:
             inherited = sorted(
                 name
                 for name in os.environ
@@ -194,10 +249,13 @@ class ServiceController:
                     exit_code=2,
                 )
         clean_home_context = (
-            environment_context({}, clear={POWERCONTEXT_HOME_ENV}) if resolved_env is not None else nullcontext()
+            environment_context({}, clear={POWERCONTEXT_HOME_ENV}) if loaded_env is not None else nullcontext()
         )
         try:
-            with clean_home_context, server_settings_context(env_file=resolved_env) as settings:
+            with (
+                clean_home_context,
+                server_settings_context(environment=loaded_env.values if loaded_env is not None else None) as settings,
+            ):
                 host = settings.http.host
                 if not is_loopback_host(host):
                     raise ServiceError(  # noqa: TRY003
@@ -205,7 +263,7 @@ class ServiceController:
                     )
                 endpoint = _endpoint(host, settings.http.port)
                 data_dir = str(powercontext_data_dir())
-        except (EnvironmentFileError, OSError, ValidationError) as error:
+        except (ProtectedEnvironmentFileError, ServerConfigurationError) as error:
             raise ServiceError(  # noqa: TRY003
                 f"invalid personal service configuration: {error}", exit_code=2
             ) from error
@@ -214,11 +272,33 @@ class ServiceController:
             ownership=OWNERSHIP_MARKER,
             definition_version=DEFINITION_VERSION,
             package_version=version("powercontext"),
-            python_executable=str(Path(sys.executable).resolve()),
+            python_executable=os.path.abspath(sys.executable),
             endpoint=endpoint,
             data_dir=data_dir,
-            env_file=EnvironmentFileIdentity.from_path(resolved_env) if resolved_env is not None else None,
+            env_file=loaded_env.identity if loaded_env is not None else None,
         )
+
+    def _run_uninstall_stage(self, stage: str, operation: Callable[[], None]) -> None:
+        try:
+            operation()
+        except (OSError, ServiceError) as error:
+            try:
+                status = self.status()
+                artifact = self._adapter.inspect()
+                remaining = (
+                    f"remaining artifact: {self._adapter.artifact_path}; "
+                    if artifact.state is not RegistrationState.NOT_INSTALLED
+                    else "artifact removed; "
+                )
+                recovery = remaining + f"run `{self._adapter.uninstall_recovery(stage)}`"
+                status = replace(status, recovery_action=recovery)
+            except Exception:
+                status = None
+            raise ServiceError(  # noqa: TRY003
+                f"personal service uninstall failed during {stage}: {error}",
+                exit_code=error.exit_code if isinstance(error, ServiceError) else 1,
+                status=status,
+            ) from error
 
     def _post_commit_error(self, message: str, *, exit_code: int = 1) -> ServiceError:
         try:
@@ -228,6 +308,7 @@ class ServiceController:
         return ServiceError(message, exit_code=exit_code, status=status)
 
     def _commit_definition(self, definition: ServiceDefinition, previous: bytes | None) -> None:
+        self._require_mutable_manager_registration(self._adapter.loaded_registration())
         content = self._adapter.render(definition)
         try:
             self._adapter.write(content)
@@ -243,6 +324,13 @@ class ServiceController:
                     self._adapter.enable()
             raise
 
+    def _remove_owned_artifact(self) -> None:
+        registration = self._adapter.inspect()
+        if registration.state is RegistrationState.NOT_INSTALLED:
+            return
+        self._require_mutable_registration(registration)
+        self._adapter.remove()
+
     def _wait_until_live(self, endpoint: str) -> ProbeResult:
         deadline = time.monotonic() + _START_TIMEOUT_SECONDS
         delay = 0.1
@@ -257,6 +345,11 @@ class ServiceController:
     def _require_mutable_registration(registration: NativeRegistration) -> None:
         if registration.state in {RegistrationState.INVALID, RegistrationState.UNKNOWN}:
             raise ServiceError(registration.detail or "the native service registration cannot be safely modified")
+
+    @staticmethod
+    def _require_mutable_manager_registration(registration: ManagerRegistration) -> None:
+        if registration.state in {ManagerOwnershipState.FOREIGN, ManagerOwnershipState.UNKNOWN}:
+            raise ServiceError(registration.detail or "the native manager registration cannot be safely modified")
 
 
 @contextmanager
@@ -284,25 +377,6 @@ def _service_lock(path: Path, *, timeout: float = 5.0) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _validate_environment_file(path: Path) -> Path:
-    try:
-        if path.is_symlink():
-            raise ServiceError("--env-file must not be a symbolic link", exit_code=2)  # noqa: TRY003
-        resolved = path.expanduser().resolve(strict=True)
-        status = resolved.stat()
-    except OSError as error:
-        raise ServiceError(f"invalid --env-file: {error}", exit_code=2) from error  # noqa: TRY003
-    if not stat.S_ISREG(status.st_mode):
-        raise ServiceError("--env-file must be a regular file", exit_code=2)  # noqa: TRY003
-    if status.st_uid != os.getuid():
-        raise ServiceError("--env-file must be owned by the current user", exit_code=2)  # noqa: TRY003
-    if status.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ServiceError(  # noqa: TRY003
-            "--env-file must be accessible only by its owner; run `chmod 600 <path>`", exit_code=2
-        )
-    return resolved
-
-
 def _endpoint(host: str, port: int) -> str:
     normalized = host.strip("[]")
     rendered_host = f"[{normalized}]" if ":" in normalized else normalized
@@ -313,9 +387,12 @@ def _recovery_action(
     definition: DefinitionState,
     manager: ManagerState,
     probe: ProbeResult,
+    loaded: ManagerRegistration,
 ) -> str | None:
     if definition in {DefinitionState.STALE, DefinitionState.MISSING_EXECUTABLE}:
         return "run `powercontext service install` to reconcile the installed definition"
+    if loaded.state in {ManagerOwnershipState.FOREIGN, ManagerOwnershipState.UNKNOWN}:
+        return "inspect the native manager registration; its PowerContext ownership could not be verified"
     if manager in {ManagerState.FAILED, ManagerState.INACTIVE}:
         return "inspect the native service logs, then run `powercontext service install`"
     if probe.state is ProbeState.CONFLICT:

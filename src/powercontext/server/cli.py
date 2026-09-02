@@ -22,8 +22,7 @@ from typing import Annotated, Any
 import typer
 from pydantic import ValidationError
 
-from powercontext.cli.env_file import EnvironmentFileError
-from powercontext.server.configuration import server_settings_context
+from powercontext.server.configuration import ServerConfigurationError, server_settings_context
 from powercontext.server.factory import create_server_app
 from powercontext.server.logging import configure_server_logging
 from powercontext.server.settings import (
@@ -79,11 +78,12 @@ def run(
     try:
         with server_settings_context(host=host, port=port, env_file=env_file) as settings:
             _run_configured_server(settings)
-    except (EnvironmentFileError, OSError) as error:
-        typer.echo(f"Invalid value for --env-file: {error}", err=True)
+    except ServerConfigurationError as error:
+        if isinstance(error.cause, ValidationError):
+            raise _friendly_bad_parameter(error.cause) from error
+        hint = "Invalid value for --env-file" if env_file is not None else "Invalid Server configuration"
+        typer.echo(f"{hint}: {error}", err=True)
         raise typer.Exit(code=2) from error
-    except ValidationError as error:
-        raise _friendly_bad_parameter(error) from error
 
 
 def _run_configured_server(settings: ServerSettings) -> None:

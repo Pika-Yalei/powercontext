@@ -90,6 +90,8 @@ def uninstall() -> None:
         status = _controller().uninstall()
     except (OSError, ServiceError) as error:
         typer.echo(f"PowerContext personal service uninstall failed: {error}", err=True)
+        if isinstance(error, ServiceError) and error.status is not None:
+            _write_status(error.status, json_output=False)
         raise typer.Exit(code=error.exit_code if isinstance(error, ServiceError) else 1) from error
     typer.echo("PowerContext personal service uninstalled.")
     _write_status(status, json_output=False)
@@ -106,6 +108,7 @@ def _write_status(status: ServiceStatus, *, json_output: bool) -> None:
     typer.echo(f"support: {status.support.value}")
     typer.echo(f"registration: {status.registration.value}")
     typer.echo(f"definition: {status.definition.value}")
+    typer.echo(f"manager ownership: {status.manager_ownership.value}")
     typer.echo(f"manager: {status.manager.value}")
     liveness = status.server_liveness.value
     if status.endpoint is not None:

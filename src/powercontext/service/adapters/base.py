@@ -25,7 +25,10 @@ from pathlib import Path
 from typing import Protocol
 
 from powercontext.service.model import (
+    DEFINITION_VERSION,
     DefinitionState,
+    ManagerOwnershipState,
+    ManagerRegistration,
     ManagerState,
     NativeRegistration,
     RegistrationState,
@@ -40,9 +43,13 @@ class NativeServiceAdapter(Protocol):
     artifact_path: Path
     lock_path: Path
 
+    def platform_support(self) -> tuple[SupportState, str]: ...
+
     def support(self) -> tuple[SupportState, str]: ...
 
     def inspect(self) -> NativeRegistration: ...
+
+    def loaded_registration(self) -> ManagerRegistration: ...
 
     def render(self, definition: ServiceDefinition) -> bytes: ...
 
@@ -66,6 +73,8 @@ class NativeServiceAdapter(Protocol):
 
     def log_location(self, definition: ServiceDefinition | None) -> str | None: ...
 
+    def uninstall_recovery(self, stage: str) -> str: ...
+
 
 class UnsupportedAdapter:
     identifier = "powercontext"
@@ -78,8 +87,14 @@ class UnsupportedAdapter:
     def support(self) -> tuple[SupportState, str]:
         return SupportState.UNSUPPORTED, self._detail
 
+    def platform_support(self) -> tuple[SupportState, str]:
+        return self.support()
+
     def inspect(self) -> NativeRegistration:
         return NativeRegistration(RegistrationState.UNKNOWN, detail=self._detail)
+
+    def loaded_registration(self) -> ManagerRegistration:
+        return ManagerRegistration(ManagerOwnershipState.UNKNOWN, detail=self._detail)
 
     def render(self, definition: ServiceDefinition) -> bytes:
         raise ServiceError(self._detail)
@@ -113,6 +128,9 @@ class UnsupportedAdapter:
 
     def log_location(self, definition: ServiceDefinition | None) -> str | None:
         return None
+
+    def uninstall_recovery(self, stage: str) -> str:
+        return self._detail
 
 
 def encode_metadata(definition: ServiceDefinition) -> str:
@@ -171,19 +189,15 @@ def definition_state(
     if not Path(definition.python_executable).is_file():
         return DefinitionState.MISSING_EXECUTABLE
     if (
-        definition.definition_version != 1
+        definition.definition_version != DEFINITION_VERSION
         or definition.package_version != package_version
-        or Path(definition.python_executable).resolve() != Path(python_executable).resolve()
+        or os.path.abspath(definition.python_executable) != os.path.abspath(python_executable)
     ):
         return DefinitionState.STALE
     if definition.env_file is not None:
-        path = Path(definition.env_file.path)
-        if path.is_symlink() or not path.is_file():
-            return DefinitionState.STALE
-        try:
-            if definition.env_file != definition.env_file.from_path(path):
-                return DefinitionState.STALE
-        except OSError:
+        from powercontext.service.environment import environment_identity_is_current
+
+        if not environment_identity_is_current(definition.env_file):
             return DefinitionState.STALE
     return DefinitionState.CURRENT
 

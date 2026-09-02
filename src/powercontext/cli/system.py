@@ -36,7 +36,7 @@ from pydantic import ValidationError
 
 from powercontext.http import HealthResponse, ReadinessResponse, ReadinessStatus
 from powercontext.paths import powercontext_data_dir
-from powercontext.transport import is_loopback_host
+from powercontext.transport import canonical_loopback_endpoint, is_loopback_host
 
 HELP_OPTION_NAMES = ("-h", "--help")
 DEFAULT_MARKETPLACE_SOURCE = "oceanbase/powercontext"
@@ -1076,8 +1076,9 @@ def _local_service_diagnostics(server_url: str) -> dict[str, Diagnostic]:
         SupportState,
     )
 
+    controller = ServiceController()
     try:
-        status = ServiceController().status()
+        status = controller.registration_status()
     except Exception as error:  # Native diagnostics must not hide the Server checks that follow.
         return {
             "service_support": Diagnostic(
@@ -1110,8 +1111,23 @@ def _local_service_diagnostics(server_url: str) -> dict[str, Diagnostic]:
             detail=status.detail or status.registration.value,
         )
         return diagnostics
-    if status.endpoint is not None and status.endpoint.rstrip("/") != server_url.rstrip("/"):
+    if status.endpoint is None or canonical_loopback_endpoint(status.endpoint) != canonical_loopback_endpoint(
+        server_url
+    ):
         return {}
+
+    try:
+        status = controller.status()
+    except Exception as error:  # Manager diagnostics must not hide the Server checks that follow.
+        diagnostics["service_registration"] = Diagnostic(
+            status=DiagnosticStatus.OK,
+            detail="installed",
+        )
+        diagnostics["service_manager"] = Diagnostic(
+            status=DiagnosticStatus.DEGRADED,
+            detail=f"personal service manager status is unavailable: {error}",
+        )
+        return diagnostics
 
     diagnostics["service_registration"] = Diagnostic(
         status=DiagnosticStatus.OK,
@@ -1124,9 +1140,9 @@ def _local_service_diagnostics(server_url: str) -> dict[str, Diagnostic]:
     diagnostics["service_manager"] = Diagnostic(
         status=(DiagnosticStatus.OK if status.manager is ManagerState.ACTIVE else DiagnosticStatus.FAILED),
         detail=(
-            status.manager.value
+            f"{status.manager.value}; ownership: {status.manager_ownership.value}"
             if status.log_location is None
-            else f"{status.manager.value}; logs: {status.log_location}"
+            else (f"{status.manager.value}; ownership: {status.manager_ownership.value}; logs: {status.log_location}")
         ),
     )
     return diagnostics

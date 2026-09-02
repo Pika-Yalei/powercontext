@@ -26,6 +26,9 @@ powercontext service install --env-file .env
 `config show` 会隐藏已识别及生成器记录的凭据，但仍应把原文件当作可能含有秘密的部署文件保护。完整的引导与验证流程见
 [完整功能 Quick Start](../how-to/full-capability-runtime.md)。
 
+`service install` 还要求该文件是当前用户拥有的普通非符号链接文件，且 group 和 other 均无访问权限。服务会记录文件
+身份；文件被替换或其 owner、权限、内容发生变化后会拒绝启动。确认修改是预期行为后，请重新执行 `service install`。
+
 ## 用户数据
 
 `POWERCONTEXT_HOME` 可覆盖已安装 Server 使用的数据目录：

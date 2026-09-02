@@ -29,6 +29,15 @@ from powercontext.cli.app import create_cli
 from powercontext.cli.system import Diagnostic, DiagnosticStatus, doctor_app, setup_app
 from powercontext.paths import default_scheduler_path
 from powercontext.server.settings import ServerSettings
+from powercontext.service.model import (
+    DefinitionState,
+    LivenessState,
+    ManagerOwnershipState,
+    ManagerState,
+    RegistrationState,
+    ServiceStatus,
+    SupportState,
+)
 
 
 def test_server_defaults_to_persistent_user_storage(
@@ -547,6 +556,80 @@ def test_doctor_reports_each_check_and_exits_nonzero_on_failure(monkeypatch) -> 
             },
         },
     }
+
+
+def _service_status(
+    *,
+    endpoint: str = "http://127.0.0.1:8000",
+    manager: ManagerState = ManagerState.UNKNOWN,
+    ownership: ManagerOwnershipState = ManagerOwnershipState.UNKNOWN,
+) -> ServiceStatus:
+    return ServiceStatus(
+        support=SupportState.SUPPORTED,
+        registration=RegistrationState.INSTALLED,
+        definition=DefinitionState.CURRENT,
+        manager=manager,
+        server_liveness=LivenessState.UNKNOWN,
+        endpoint=endpoint,
+        log_location="fake logs",
+        manager_ownership=ownership,
+    )
+
+
+def test_doctor_mismatched_local_endpoint_skips_service_query_and_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Controller:
+        def registration_status(self) -> ServiceStatus:
+            return _service_status()
+
+        def status(self) -> ServiceStatus:
+            raise AssertionError(  # noqa: TRY003
+                "mismatched endpoint must not query the manager or registered endpoint"
+            )
+
+    monkeypatch.setattr("powercontext.service.controller.ServiceController", Controller)
+
+    assert system_cli._local_service_diagnostics("http://127.0.0.1:9000") == {}
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["http://localhost:8000", "http://127.0.0.2:8000/", "http://[::1]:8000"],
+)
+def test_doctor_matching_loopback_endpoint_includes_service_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    calls: list[str] = []
+
+    class Controller:
+        def registration_status(self) -> ServiceStatus:
+            calls.append("registration")
+            return _service_status()
+
+        def status(self) -> ServiceStatus:
+            calls.append("manager")
+            return _service_status(
+                manager=ManagerState.ACTIVE,
+                ownership=ManagerOwnershipState.OWNED,
+            )
+
+    monkeypatch.setattr("powercontext.service.controller.ServiceController", Controller)
+
+    diagnostics = system_cli._local_service_diagnostics(target)
+
+    assert calls == ["registration", "manager"]
+    assert diagnostics["service_registration"].status is DiagnosticStatus.OK
+    assert diagnostics["service_manager"].status is DiagnosticStatus.OK
+
+
+@pytest.mark.parametrize("target", ["https://memory.example", "http://192.0.2.10:8000"])
+def test_doctor_remote_endpoint_skips_local_registration(monkeypatch: pytest.MonkeyPatch, target: str) -> None:
+    monkeypatch.setattr(
+        "powercontext.service.controller.ServiceController",
+        Mock(side_effect=AssertionError("remote endpoint must not inspect the local service")),
+    )
+
+    assert system_cli._local_service_diagnostics(target) == {}
 
 
 class _Response(BytesIO):
