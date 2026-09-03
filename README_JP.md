@@ -33,7 +33,18 @@ uv tool install "powercontext[cli,server]==0.1.0"
 # uv tool install "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@master"
 ```
 
-別のターミナルでローカル Server を起動します：
+ターミナルを閉じても動作を続け、次回ログイン時に再び起動できる個人用 Server を実行するには、現在のユーザー用
+ネイティブサービスをインストールします：
+
+```bash
+powercontext service install # Uninstall with `powercontext service uninstall`
+powercontext service status
+```
+
+Windows では、ログイン起動のオプションを指定しない場合、次回ログイン時の自動起動を有効にするか確認します。
+Enter を押すと既定では無効のままです。明示的に選ぶ場合は `--start-on-login` または `--no-start-on-login` を指定します。
+
+ターミナルでフォアグラウンド実行する場合は、次のコマンドを使用できます：
 
 ```bash
 powercontext server run

@@ -33,7 +33,17 @@ uv tool install "powercontext[cli,server]==0.1.0"
 # uv tool install "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@master"
 ```
 
-在单独的终端中启动本地 Server：
+如需让个人 Server 在终端关闭后继续运行，并可以在下次登录后再次启动，请安装原生当前用户服务：
+
+```bash
+powercontext service install # 卸载请运行 `powercontext service uninstall`
+powercontext service status
+```
+
+在 Windows 上，未提供登录启动选项时，安装器会询问是否在下次登录时自动启动；直接按 Enter 的默认选择是不启用。
+需要显式选择时，请使用 `--start-on-login` 或 `--no-start-on-login`。
+
+如果想在终端以前台方式使用，可以运行：
 
 ```bash
 powercontext server run
