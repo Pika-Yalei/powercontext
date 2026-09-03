@@ -97,7 +97,7 @@ def test_secure_env_loader_rejects_recorded_identity_drift(tmp_path: Path, mutat
     environment = _environment_file(tmp_path)
     identity = EnvironmentFileIdentity.from_path(environment)
     if mutation == "content":
-        environment.write_text("POWERCONTEXT_SERVER_HTTP_PORT=9000\n", encoding="utf-8")
+        environment.write_text("POWERCONTEXT_SERVER_HTTP_PORT=19000\n", encoding="utf-8")
     else:
         environment.chmod(0o400)
 
